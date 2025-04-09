@@ -125,7 +125,55 @@ def df_to_model_inputs(df, input_keys):
         data[key] = arr
     return data
 
+def train_model_on_files(file_list, epochs=EPOCH):
+    """
+    Обучает модель на списке файлов.
+    """
+    all_dfs = [load_csv_clean(f) for f in file_list]
+    df = pd.concat(all_dfs, ignore_index=True)
+    
+    full_model = build_full_model(df, encoding_dim=32)
+    input_keys = list(full_model.input.keys())
+    X = df_to_model_inputs(df, input_keys)
+    
+    # Получаем целевое значение через встроенную подсеть препроцессинга
+    inputs, preprocessed = build_preprocessor_model(df)
+    preprocessor_model = models.Model(inputs=inputs, outputs=preprocessed, name="preprocessor")
+    y = preprocessor_model.predict(X)
+    
+    full_model.fit(X, y, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
+    full_model.save(MODEL_PATH)
+    print(f"\n✅ Модель сохранена в {MODEL_PATH}")
+
+def continue_training(file_list, epochs=EPOCH):
+    """
+    Дообучает модель на новых данных.
+    """
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError("Модель не найдена. Сначала обучите модель.")
+    
+    full_model = tf.keras.models.load_model(MODEL_PATH, compile=True)
+    
+    all_dfs = [load_csv_clean(f) for f in file_list]
+    df = pd.concat(all_dfs, ignore_index=True)
+    input_keys = list(full_model.input.keys())
+    X = df_to_model_inputs(df, input_keys)
+    
+    # Получаем целевые признаки через уровень "concatenated_features"
+    preprocessor_model = models.Model(inputs=full_model.input,
+                                      outputs=full_model.get_layer("concatenated_features").output,
+                                      name="preprocessor")
+    y = preprocessor_model.predict(X)
+    
+    full_model.fit(X, y, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
+    full_model.save(MODEL_PATH)
+    print(f"\n🔄 Дообучение завершено. Модель обновлена.")
+
 def validate_file_with_autoencoder(file_path, threshold=0.01):
+    """
+    Валидирует новый файл на основе обученной модели.
+    Строки с высокой ошибкой восстановления помечаются как невалидные.
+    """
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError("Модель не найдена.")
     
