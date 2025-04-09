@@ -1,121 +1,205 @@
 import os
 import pandas as pd
 import numpy as np
-import joblib
 import tensorflow as tf
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.impute import SimpleImputer
 from tensorflow.keras import layers, models
 
 MODEL_PATH = "model.h5"
-PREPROCESSOR_PATH = "preprocessor.pkl"
-
 
 def load_csv_clean(file_path):
+    """
+    Загружает CSV, оставляет столбцы типов number, object, bool.
+    Для object и bool приводим значения к строке.
+    """
     df = pd.read_csv(file_path)
     df = df.select_dtypes(include=["number", "object", "bool"])
-
-    # Приводим все object/bool колонки к строкам
+    
     for col in df.select_dtypes(include=["object", "bool"]).columns:
         df[col] = df[col].astype(str).fillna("missing")
-
-    # Преобразуем числовые значения (если они строками закодированы)
+    # Если в числовых колонках встречаются строки, их можно попробовать привести к числу;
+    # если не получится – оставим как есть, потому что на этапе обучения валидационные данные должны быть корректными.
     for col in df.select_dtypes(include=["int64", "float64"]).columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna()
+    df = df.dropna()  # в обучающих данных допускаем только записи без NaN
     return df
 
-
-def build_preprocessor(df):
-    numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
+def build_preprocessor_model(df):
+    """
+    Строит модель-предобработчик, которая для каждого столбца возвращает числовой вектор.
+    Определяем числовые и категориальные колонки на основе типов pandas.
+    Возвращаем:
+      - inputs: словарь Keras Input-слоёв (ключ – имя колонки)
+      - outputs: объединённый выходной тензор (числовой вектор фиксированной длины)
+    """
+    inputs = {}
+    processed_features = []
+    
+    # Числовые колонки
+    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    for col in numeric_cols:
+        inp = layers.Input(shape=(1,), name=col)
+        # Нормализатор; адаптируем на значениях этой колонки
+        norm = layers.Normalization(name=f"{col}_norm")
+        # Для адаптации нужно передать в виде массива (2D)
+        norm.adapt(df[col].values.reshape(-1, 1))
+        processed = norm(inp)
+        inputs[col] = inp
+        processed_features.append(processed)
+    
+    # Категориальные колонки (включая булевое и даты, если они представлены как строки)
     categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+    for col in categorical_cols:
+        inp = layers.Input(shape=(1,), name=col, dtype=tf.string)
+        # Определяем слой для преобразования строки в индекс
+        lookup = layers.StringLookup(name=f"{col}_lookup")
+        lookup.adapt(df[col].values)
+        encoded = lookup(inp)
+        # Получаем размер словаря; добавляем +1, если нужно (зависит от реализации)
+        num_tokens = lookup.vocabulary_size()
+        # One-hot кодирование
+        onehot = layers.CategoryEncoding(num_tokens=num_tokens, output_mode="one_hot", name=f"{col}_onehot")
+        processed = onehot(encoded)
+        inputs[col] = inp
+        processed_features.append(processed)
+    
+    # Объединяем все признаки в единый вектор
+    if len(processed_features) > 1:
+        concatenated = layers.concatenate(processed_features, name="concatenated_features")
+    else:
+        concatenated = processed_features[0]
+    
+    return inputs, concatenated
 
-    preprocessor = ColumnTransformer([
-        ("num", Pipeline([
-            ("imputer", SimpleImputer(strategy="mean")),
-            ("scaler", StandardScaler())
-        ]), numeric_cols),
-        ("cat", Pipeline([
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-        ]), categorical_cols)
-    ])
-    return preprocessor
-
-
-def build_autoencoder(input_dim, encoding_dim=32):
-    input_layer = layers.Input(shape=(input_dim,))
-    encoded = layers.Dense(encoding_dim, activation="relu")(input_layer)
+def build_autoencoder_model(input_dim, encoding_dim=32):
+    """
+    Строит автоэнкодер, который принимает на вход вектор размерности input_dim и восстанавливает его.
+    """
+    ae_input = layers.Input(shape=(input_dim,), name="ae_input")
+    encoded = layers.Dense(encoding_dim, activation="relu")(ae_input)
     decoded = layers.Dense(input_dim, activation="sigmoid")(encoded)
-    model = models.Model(inputs=input_layer, outputs=decoded)
-    model.compile(optimizer="adam", loss="mse")
-    return model
+    autoencoder = models.Model(inputs=ae_input, outputs=decoded, name="autoencoder")
+    autoencoder.compile(optimizer="adam", loss="mse")
+    return autoencoder
 
+def build_full_model(df, encoding_dim=32):
+    """
+    Строит полную модель, в которой:
+      - Входы – это данные (словарь, по столбцам)
+      - Через встроенную модель-предобработчик вычисляется числовой вектор
+      - Этот вектор подаётся на вход автоэнкодера
+      - На выходе получаем реконструированный вектор
+    Для обучения целевым значением будет результат предобработки.
+    """
+    inputs, preprocessed = build_preprocessor_model(df)
+    # Определим размерность полученного вектора
+    input_dim = preprocessed.shape[-1]
+    autoencoder = build_autoencoder_model(input_dim, encoding_dim)
+    
+    # Получаем реконструкцию
+    reconstruction = autoencoder(preprocessed)
+    
+    # Полная модель: на вход подаётся словарь, а выход – реконструкция предобработанного вектора
+    full_model = models.Model(inputs=inputs, outputs=reconstruction, name="full_autoencoder")
+    full_model.compile(optimizer="adam", loss="mse")
+    return full_model
+
+def df_to_model_inputs(df, input_keys):
+    """
+    Преобразует DataFrame в словарь для подачи в модель.
+    input_keys – список названий колонок, ожидаемых моделью.
+    """
+    data = {}
+    for key in input_keys:
+        # гарантируем, что данные имеют форму (n,1)
+        data[key] = df[key].values.reshape(-1, 1)
+    return data
 
 def train_model_on_files(file_list, epochs=20):
+    # Объединяем данные из всех файлов
     all_dfs = [load_csv_clean(f) for f in file_list]
     df = pd.concat(all_dfs, ignore_index=True)
-
-    preprocessor = build_preprocessor(df)
-    X = preprocessor.fit_transform(df)
-
-    model = build_autoencoder(X.shape[1])
-    model.fit(X, X, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
-
-    joblib.dump(preprocessor, PREPROCESSOR_PATH)
-    model.save(MODEL_PATH)
+    
+    # Строим модель с интегрированным препроцессингом
+    full_model = build_full_model(df, encoding_dim=32)
+    
+    # Получаем список входных ключей для модели
+    input_keys = list(full_model.input.keys())
+    X = df_to_model_inputs(df, input_keys)
+    
+    # Для автоэнкодера в качестве целевого значения используем результат предобработки,
+    # поэтому сделаем отдельную модель для этого.
+    # Здесь мы получаем предобработанные векторы, используя встроенную подсеть.
+    inputs, preprocessed = build_preprocessor_model(df)
+    preprocessor_model = models.Model(inputs=inputs, outputs=preprocessed, name="preprocessor")
+    y = preprocessor_model.predict(X)
+    
+    full_model.fit(X, y, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
+    
+    # Сохраняем всю модель, включая слои препроцессинга
+    full_model.save(MODEL_PATH)
     print(f"\n✅ Модель сохранена в {MODEL_PATH}")
-    print(f"✅ Преобразователь сохранён в {PREPROCESSOR_PATH}")
-
 
 def continue_training(file_list, epochs=10):
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(PREPROCESSOR_PATH):
-        raise FileNotFoundError("Модель или препроцессор не найдены. Сначала обучите модель.")
-
-    model = tf.keras.models.load_model(MODEL_PATH)
-    preprocessor = joblib.load(PREPROCESSOR_PATH)
-
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError("Модель не найдена. Сначала обучите модель.")
+    
+    full_model = tf.keras.models.load_model(MODEL_PATH, compile=True)
+    
     all_dfs = [load_csv_clean(f) for f in file_list]
     df = pd.concat(all_dfs, ignore_index=True)
-    X = preprocessor.transform(df)
-
-    model.fit(X, X, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
-    model.save(MODEL_PATH)
+    
+    # Для дообучения используем те же входные ключи, что и у модели
+    input_keys = list(full_model.input.keys())
+    X = df_to_model_inputs(df, input_keys)
+    
+    # Получаем целевые значения через встроенную предобработку (подсеть)
+    # Для этого извлечём подсеть из модели.
+    # Предполагаем, что на именованном уровне модель имеет часть с именем "concatenated_features"
+    preprocessor_model = models.Model(inputs=full_model.input,
+                                      outputs=full_model.get_layer("concatenated_features").output,
+                                      name="preprocessor")
+    y = preprocessor_model.predict(X)
+    
+    full_model.fit(X, y, epochs=epochs, batch_size=32, shuffle=True, verbose=1)
+    full_model.save(MODEL_PATH)
     print(f"\n🔄 Дообучение завершено. Модель обновлена.")
 
-
 def validate_file(file_path, threshold=0.01):
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(PREPROCESSOR_PATH):
-        raise FileNotFoundError("Модель или препроцессор не найдены.")
-
-    model = tf.keras.models.load_model(MODEL_PATH)
-    preprocessor = joblib.load(PREPROCESSOR_PATH)
-
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError("Модель не найдена.")
+    
+    full_model = tf.keras.models.load_model(MODEL_PATH, compile=True)
+    
     df = load_csv_clean(file_path)
-    X = preprocessor.transform(df)
-    reconstructed = model.predict(X)
-    loss = np.mean(np.square(X - reconstructed), axis=1)
-
+    input_keys = list(full_model.input.keys())
+    X = df_to_model_inputs(df, input_keys)
+    
+    # Получаем целевое предобработанное представление для вычисления ошибки реконструкции
+    preprocessor_model = models.Model(inputs=full_model.input,
+                                      outputs=full_model.get_layer("concatenated_features").output,
+                                      name="preprocessor")
+    y_true = preprocessor_model.predict(X)
+    
+    y_pred = full_model.predict(X)
+    # Вычисляем ошибку реконструкции для каждой записи (MSE по строкам)
+    loss = np.mean(np.square(y_true - y_pred), axis=1)
+    
     df["ValidationLoss"] = loss
     df["IsValid"] = df["ValidationLoss"] < threshold
-
+    
     print(df[["ValidationLoss", "IsValid"]].head())
     print(f"\n✅ Валидных записей: {(df['IsValid']).sum()} из {len(df)}")
-
+    
     return df
-
 
 # === ПРИМЕР ИСПОЛЬЗОВАНИЯ ===
 if __name__ == "__main__":
-    # === ОБУЧЕНИЕ С НУЛЯ ===
+    # Для обучения на корректных данных (учебный набор содержит валидные записи)
     # train_model_on_files(["data1.csv", "data2.csv"])
-
-    # === ДОOБУЧЕНИЕ НА НОВЫХ ДАННЫХ ===
+    
+    # Для дообучения на новых данных
     # continue_training(["data3.csv"])
-
-    # === ПРОВЕРКА НОВОГО ФАЙЛА ===
+    
+    # Для проверки нового файла (на вход можно подавать любые данные)
     # validate_file("unseen_data.csv", threshold=0.02)
     pass
