@@ -111,19 +111,19 @@ def df_to_model_inputs(df, input_keys):
     """
     Преобразует DataFrame в словарь для подачи в модель.
     Ключи input_keys – это безопасные имена столбцов (уже переименованные через sanitize).
-    Для столбцов с типом object явно задаём строковый тип.
+    Для столбцов с типом object явно задаём строковый тип (dtype='U'),
+    для числовых – приводим к float32.
     """
     data = {}
     for key in input_keys:
         col = df[key]
-        # Если столбец object, явно приводим к строкам с нужным dtype
         if col.dtype == "object":
-            arr = col.astype(np.str_).values.reshape(-1, 1)
+            # Приводим к Unicode-строкам
+            arr = col.astype('U').to_numpy().reshape(-1, 1)
         else:
-            arr = col.values.reshape(-1, 1)
+            arr = col.to_numpy().astype('float32').reshape(-1, 1)
         data[key] = arr
     return data
-
 
 def train_model_on_files(file_list, epochs=EPOCH):
     all_dfs = [load_csv_clean(f) for f in file_list]
@@ -133,7 +133,7 @@ def train_model_on_files(file_list, epochs=EPOCH):
     input_keys = list(full_model.input.keys())
     X = df_to_model_inputs(df, input_keys)
     
-    # Для целевого значения получаем результат препроцессинга с помощью встроенной подсети.
+    # Получаем целевое значение через встроенную подсеть препроцессинга
     inputs, preprocessed = build_preprocessor_model(df)
     preprocessor_model = models.Model(inputs=inputs, outputs=preprocessed, name="preprocessor")
     y = preprocessor_model.predict(X)
@@ -153,7 +153,7 @@ def continue_training(file_list, epochs=EPOCH):
     input_keys = list(full_model.input.keys())
     X = df_to_model_inputs(df, input_keys)
     
-    # Получаем целевые признаки через часть модели (уровень "concatenated_features")
+    # Получаем целевые признаки через уровень "concatenated_features"
     preprocessor_model = models.Model(inputs=full_model.input,
                                       outputs=full_model.get_layer("concatenated_features").output,
                                       name="preprocessor")
@@ -172,7 +172,7 @@ def validate_file(file_path, threshold=0.01):
     input_keys = list(full_model.input.keys())
     X = df_to_model_inputs(df, input_keys)
     
-    # Получаем целевое представление через встроенную предобработку
+    # Получаем представление через встроенную предобработку
     preprocessor_model = models.Model(inputs=full_model.input,
                                       outputs=full_model.get_layer("concatenated_features").output,
                                       name="preprocessor")
