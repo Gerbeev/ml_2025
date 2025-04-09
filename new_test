@@ -1,23 +1,3 @@
-def df_to_model_inputs(df, input_keys):
-    """
-    Преобразует DataFrame в словарь для подачи в модель.
-    Для столбцов с типом object формируем массив с элементами типа np.unicode_,
-    для остальных – массив с dtype np.float32.
-    """
-    data = {}
-    for key in input_keys:
-        col = df[key]
-        if col.dtype == "object":
-            # Используем list comprehension, чтобы взять стандартные Python‑строки,
-            # затем превращаем их в numpy-массив с dtype=np.unicode_
-            arr = np.array([str(x) for x in col.tolist()], dtype=np.unicode_).reshape(-1, 1)
-        else:
-            arr = np.array(col.tolist(), dtype=np.float32).reshape(-1, 1)
-        data[key] = arr
-    return data
-
-
-
 import os
 import re
 import pandas as pd
@@ -130,17 +110,18 @@ def build_full_model(df, encoding_dim=32):
 def df_to_model_inputs(df, input_keys):
     """
     Преобразует DataFrame в словарь для подачи в модель.
-    Ключи input_keys – это безопасные имена столбцов (уже переименованные через sanitize).
-    Для столбцов с типом object берем список значений и формируем массив с dtype=np.str_,
-    для остальных – массив с dtype=np.float32.
+    Для столбцов с типом object формируем тензор с dtype=tf.string,
+    для остальных – тензор с dtype=tf.float32.
     """
     data = {}
     for key in input_keys:
         col = df[key]
         if col.dtype == "object":
-            arr = np.array(col.tolist(), dtype=np.str_).reshape(-1, 1)
+            arr = tf.convert_to_tensor(col.astype(str).tolist(), dtype=tf.string)
+            arr = tf.reshape(arr, (-1, 1))
         else:
-            arr = np.array(col.tolist(), dtype=np.float32).reshape(-1, 1)
+            arr = tf.convert_to_tensor(col.to_numpy().astype(np.float32), dtype=tf.float32)
+            arr = tf.reshape(arr, (-1, 1))
         data[key] = arr
     return data
 
