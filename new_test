@@ -111,17 +111,16 @@ def df_to_model_inputs(df, input_keys):
     """
     Преобразует DataFrame в словарь для подачи в модель.
     Ключи input_keys – это безопасные имена столбцов (уже переименованные через sanitize).
-    Для столбцов с типом object явно задаём строковый тип (dtype='U'),
-    для числовых – приводим к float32.
+    Для столбцов с типом object берем список значений и формируем массив с dtype=np.str_,
+    для остальных – массив с dtype=np.float32.
     """
     data = {}
     for key in input_keys:
         col = df[key]
         if col.dtype == "object":
-            # Приводим к Unicode-строкам
-            arr = col.astype('U').to_numpy().reshape(-1, 1)
+            arr = np.array(col.tolist(), dtype=np.str_).reshape(-1, 1)
         else:
-            arr = col.to_numpy().astype('float32').reshape(-1, 1)
+            arr = np.array(col.tolist(), dtype=np.float32).reshape(-1, 1)
         data[key] = arr
     return data
 
