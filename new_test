@@ -1,3 +1,23 @@
+def df_to_model_inputs(df, input_keys):
+    """
+    Преобразует DataFrame в словарь для подачи в модель.
+    Для столбцов с типом object формируем массив с элементами типа np.unicode_,
+    для остальных – массив с dtype np.float32.
+    """
+    data = {}
+    for key in input_keys:
+        col = df[key]
+        if col.dtype == "object":
+            # Используем list comprehension, чтобы взять стандартные Python‑строки,
+            # затем превращаем их в numpy-массив с dtype=np.unicode_
+            arr = np.array([str(x) for x in col.tolist()], dtype=np.unicode_).reshape(-1, 1)
+        else:
+            arr = np.array(col.tolist(), dtype=np.float32).reshape(-1, 1)
+        data[key] = arr
+    return data
+
+
+
 import os
 import re
 import pandas as pd
